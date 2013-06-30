@@ -1,0 +1,11 @@
+*.gpx
+*.GPX
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
+*.o
+CMakeCache.txt
+CMakeFiles
+*.cmake
+Makefile

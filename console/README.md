@@ -1,0 +1,1 @@
+This is a console utility to geotag a directory of Jpeg images using a GPX file.

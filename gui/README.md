@@ -1,0 +1,1 @@
+This is (going to be) a GUI application to geotag a directory of Jpeg images using a GPX file.
