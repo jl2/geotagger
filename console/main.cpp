@@ -29,6 +29,12 @@
 #include <vector>
 #include <algorithm>
 
+#include <thread>
+#include <queue>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+
 #include <ctime>
 
 #define BOOST_SYSTEM_NO_DEPRECATED
@@ -40,21 +46,73 @@ namespace fs = boost::filesystem;
 #include "tinyxml2.h"
 namespace tx = tinyxml2;
 
+typedef std::vector< std::thread > thread_pool;
 
-void findJpegFiles(fs::path directory, std::vector<fs::path> &jpegFiles) {
+class wc_work_queue {
+public:
+    wc_work_queue() : _done(false) {}
+
+    // Add a file to the queue
+    void addFile(std::string fname) {
+        std::lock_guard<std::mutex> lock(_mut);
+        _files.push(fname);
+        _cv.notify_one();
+    }
+
+    // Retrieve a file from the queue
+    // If the queue is empty then sleep
+    // If the work is done and the queue is empty return ""
+    std::string getFile() {
+        // Lock the mutex so no other threads interfere with the queue
+        std::unique_lock<std::mutex> lock(_mut);
+
+        for (;;) {
+            if (_done && _files.size() == 0) {
+                return "";
+            }
+            // Not done working, but check for more file names to process
+            if (_files.size()>0) {
+                std::string rval = _files.front();
+                _files.pop();
+                return rval;
+            }
+            // Not done and no files in the queue, so wait
+            _cv.wait(lock);
+        }
+    }
+
+    // Set a flag indicating there will be no more files added to the queue
+    void setDone() {
+        _done = true;
+        _cv.notify_all();
+    }
+
+private:
+
+    std::queue<std::string> _files;
+
+    std::atomic<bool> _done;
+    std::mutex _mut;
+    std::mutex _resultMut;
+    std::condition_variable _cv;
+};
+
+void findJpegFiles(fs::path directory, wc_work_queue &jpegFiles) {
     // If the directory doesn't exist, it has no jpeg files, so return
     if (!fs::exists(directory)) return;
-
-    std::copy_if(fs::directory_iterator(directory), fs::directory_iterator(),
-                 std::back_inserter(jpegFiles), [](fs::path pn) {
-                     std::string fname = pn.string();
-                     bool rval = (fs::is_regular_file(pn) &&
-                                  (boost::algorithm::ends_with(fname, ".jpg")
-                                   || boost::algorithm::ends_with(fname, ".JPG")
-                                   || boost::algorithm::ends_with(fname, ".jpeg")
-                                   || boost::algorithm::ends_with(fname, ".JPEG")));
-                     return rval;
-                 });
+    std::cout << "Finding files...\n";
+    for (auto it = fs::directory_iterator(directory); it != fs::directory_iterator(); ++it) {
+        auto pn = it->path();
+        std::string fname = pn.string();
+        bool isJpeg = (fs::is_regular_file(pn) &&
+                     (boost::algorithm::ends_with(fname, ".jpg")
+                      || boost::algorithm::ends_with(fname, ".JPG")
+                      || boost::algorithm::ends_with(fname, ".jpeg")
+                      || boost::algorithm::ends_with(fname, ".JPEG")));
+        if (isJpeg) {
+            jpegFiles.addFile(fname);
+        }
+    }
 }
 
 void convertToDDMMSS(double val, int &degrees, int &minutes, double &seconds) {
@@ -177,6 +235,7 @@ bool findClosest(const std::vector<GPXPoint> &pts, std::time_t imgTime, size_t &
     idx = curGuess;
     return true;
 }
+
 std::time_t getImageTimeStamp(std::string tmpTime) {
     std::tm timeData;
     // 2013:06:26 16:33:44
@@ -211,20 +270,10 @@ void clearGPSFields(Exiv2::ExifData &exifData) {
     }
 }
 
-int main(int argc, char* const argv[]) {
-    if (argc != 3) {
-        std::cout << "Usage: " << argv[0] << " <gpsfile> <directory>\n";
-        return 1;
-    }
-
-    std::vector<GPXPoint> gpxData;
-    readGPX(argv[1], gpxData);
-    std::vector<fs::path> jpegFiles;
-
-    findJpegFiles(argv[2], jpegFiles);
-
-    for (const auto &fname : jpegFiles) {
-        std::cout << "Processing: " << fname << "\n";
+void geotag_worker(wc_work_queue &wq, std::vector<GPXPoint> &gpxData) {
+    std::string fname;
+    // Grab a file from the work queue
+    while ((fname = wq.getFile()) != "") {
         try {
             Exiv2::Image::AutoPtr image = Exiv2::ImageFactory::open(fname.c_str());
             if (image.get() == 0) continue;
@@ -232,7 +281,7 @@ int main(int argc, char* const argv[]) {
 
             Exiv2::ExifData &exifData = image->exifData();
             if (exifData.empty()) {
-                std::string error = fname.string();
+                std::string error = fname;
                 error += ": No Exif data found in the file";
                 throw Exiv2::Error(1, error);
             }
@@ -304,5 +353,34 @@ int main(int argc, char* const argv[]) {
             continue;
         }
     }
+}
+
+int main(int argc, char* const argv[]) {
+    if (argc != 3) {
+        std::cout << "Usage: " << argv[0] << " <gpsfile> <directory>\n";
+        return 1;
+    }
+    size_t numThreads = std::thread::hardware_concurrency();
+
+    std::vector<GPXPoint> gpxData;
+    readGPX(argv[1], gpxData);
+
+    // std::vector<fs::path> jpegFiles;
+    wc_work_queue wq;
+
+    thread_pool threads;
+    for (size_t i=0;i<numThreads;++i) {
+        threads.emplace_back(geotag_worker, std::ref(wq), std::ref(gpxData));
+    }
+    findJpegFiles(argv[2], wq);
+
+    // Indicate no more files will be added
+    wq.setDone();
+
+    // Wait for all the threads
+    for (auto &t : threads) {
+        t.join();
+    }
+
     return 0;
 }
