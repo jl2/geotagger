@@ -1,7 +1,7 @@
 *.gpx
 *.GPX
 *.jpg
-*.JPG
+nnnnnn*.JPG
 *.jpeg
 *.JPEG
 *.o
@@ -9,3 +9,7 @@ CMakeCache.txt
 CMakeFiles
 *.cmake
 Makefile
+
+geotagger
+geotaggui
+moc*.cpp
